@@ -51,22 +51,63 @@ local window_size = tonumber(ARGV[2])
 for i = 1, #KEYS, 2 do
     local window_key = KEYS[i]
     local counter_key = KEYS[i + 1]
+    local prev_counter_key = counter_key .. ':prev'
     local increment_value = 1
+    local ttl = window_size * 2
 
     -- Check if window exists and is valid
     local window_start = redis.call('GET', window_key)
     if not window_start or (now - tonumber(window_start)) >= window_size then
-        -- Reset window and counter
+        -- Window needs reset (expired or doesn't exist)
+        -- Get current counter before reset (becomes previous counter)
+        local current_counter = redis.call('GET', counter_key)
+        local prev_counter_value = 0
+        if current_counter then
+            prev_counter_value = tonumber(current_counter)
+        end
+
+        -- Start new window
         redis.call('SET', window_key, tostring(now))
+        redis.call('EXPIRE', window_key, ttl)
+
+        -- Save previous counter
+        redis.call('SET', prev_counter_key, prev_counter_value)
+        redis.call('EXPIRE', prev_counter_key, ttl)
+
+        -- Reset current counter to 1 (this request)
         redis.call('SET', counter_key, increment_value)
-        redis.call('EXPIRE', window_key, window_size)
-        redis.call('EXPIRE', counter_key, window_size)
+        redis.call('EXPIRE', counter_key, ttl)
+
+        -- Calculate weighted count for first request in new window
+        -- elapsed = 0, so weight = 1.0
+        local weighted_count = prev_counter_value * 1.0 + increment_value
+
         table.insert(results, tostring(now)) -- window_start
-        table.insert(results, increment_value) -- counter
+        table.insert(results, math.floor(weighted_count)) -- weighted counter
     else
-        local counter = redis.call('INCR', counter_key)
+        -- Within current window - increment counter
+        local new_counter_value = redis.call('INCR', counter_key)
+        redis.call('EXPIRE', counter_key, ttl)
+
+        -- Calculate weighted count using sliding window formula
+        local elapsed = now - tonumber(window_start)
+        local weight = 0
+        if elapsed < window_size then
+            weight = (window_size - elapsed) / window_size
+        end
+
+        -- Get previous window counter
+        local prev_counter = redis.call('GET', prev_counter_key)
+        local prev_counter_value = 0
+        if prev_counter then
+            prev_counter_value = tonumber(prev_counter)
+        end
+
+        -- Weighted count = prev_counter * weight + current_counter
+        local weighted_count = prev_counter_value * weight + new_counter_value
+
         table.insert(results, window_start) -- window_start
-        table.insert(results, counter) -- counter
+        table.insert(results, math.floor(weighted_count)) -- weighted counter
     end
 end
 
@@ -209,8 +250,12 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         window_size: int,
     ) -> List[Any]:
         """
-        Implement sliding window rate limiting logic using in-memory cache operations.
-        This follows the same logic as the Redis Lua script but uses async cache operations.
+        Implement TRUE sliding window rate limiting using weighted counter approach.
+
+        This prevents burst traffic at window boundaries by:
+        1. Tracking both previous and current window counters
+        2. Calculating weighted count based on time elapsed in current window
+        3. Formula: weighted_count = prev_counter * (1 - elapsed/window) + curr_counter
         """
         results: List[Any] = []
 
@@ -218,36 +263,61 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         for i in range(0, len(keys), 2):
             window_key = keys[i]
             counter_key = keys[i + 1]
+            prev_counter_key = f"{counter_key}:prev"
             increment_value = 1
 
-            # Get the window start time
+            # Get the current window start time
             window_start = await self.internal_usage_cache.async_get_cache(
                 key=window_key,
                 litellm_parent_otel_span=None,
                 local_only=True,
             )
 
-            # Check if window exists and is valid
+            # Check if window needs reset (expired or doesn't exist)
             if window_start is None or (now_int - int(window_start)) >= window_size:
-                # Reset window and counter
+                # Get current counter before reset (becomes previous counter)
+                current_counter = await self.internal_usage_cache.async_get_cache(
+                    key=counter_key,
+                    litellm_parent_otel_span=None,
+                    local_only=True,
+                )
+                prev_counter_value = int(current_counter) if current_counter is not None else 0
+
+                # Start new window
                 await self.internal_usage_cache.async_set_cache(
                     key=window_key,
                     value=str(now_int),
-                    ttl=window_size,
+                    ttl=window_size * 2,  # Keep for 2 windows
                     litellm_parent_otel_span=None,
                     local_only=True,
                 )
+
+                # Save previous counter
+                await self.internal_usage_cache.async_set_cache(
+                    key=prev_counter_key,
+                    value=prev_counter_value,
+                    ttl=window_size * 2,
+                    litellm_parent_otel_span=None,
+                    local_only=True,
+                )
+
+                # Reset current counter to 1 (this request)
                 await self.internal_usage_cache.async_set_cache(
                     key=counter_key,
                     value=increment_value,
-                    ttl=window_size,
+                    ttl=window_size * 2,
                     litellm_parent_otel_span=None,
                     local_only=True,
                 )
+
+                # Calculate weighted count for the first request in new window
+                # Since we just started, elapsed = 0, so weight = 1.0
+                weighted_count = prev_counter_value * 1.0 + increment_value
+
                 results.append(str(now_int))  # window_start
-                results.append(increment_value)  # counter
+                results.append(int(weighted_count))  # weighted counter
             else:
-                # Increment the counter
+                # Within current window - increment counter
                 current_counter = await self.internal_usage_cache.async_get_cache(
                     key=counter_key,
                     litellm_parent_otel_span=None,
@@ -256,15 +326,34 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 new_counter_value = (
                     int(current_counter) if current_counter is not None else 0
                 ) + increment_value
+
                 await self.internal_usage_cache.async_set_cache(
                     key=counter_key,
                     value=new_counter_value,
-                    ttl=window_size,
+                    ttl=window_size * 2,
                     litellm_parent_otel_span=None,
                     local_only=True,
                 )
+
+                # Calculate weighted count using sliding window formula
+                # elapsed = time since current window started
+                elapsed = now_int - int(window_start)
+                # weight = remaining time in previous window / window_size
+                weight = (window_size - elapsed) / window_size if elapsed < window_size else 0
+
+                # Get previous window counter
+                prev_counter = await self.internal_usage_cache.async_get_cache(
+                    key=prev_counter_key,
+                    litellm_parent_otel_span=None,
+                    local_only=True,
+                )
+                prev_counter_value = int(prev_counter) if prev_counter is not None else 0
+
+                # Weighted count = prev_counter * weight + current_counter
+                weighted_count = prev_counter_value * weight + new_counter_value
+
                 results.append(window_start)  # window_start
-                results.append(new_counter_value)  # counter
+                results.append(int(weighted_count))  # weighted counter
 
         return results
 

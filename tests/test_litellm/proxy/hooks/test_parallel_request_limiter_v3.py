@@ -56,9 +56,9 @@ async def test_sliding_window_rate_limit_v3(monkeypatch, time_controller):
         time_provider=time_controller.now,
     )
 
-    # Mock the batch_rate_limiter_script to simulate window expiry and use correct key construction
+    # Mock the batch_rate_limiter_script to simulate True Sliding Window
     window_starts: Dict[str, int] = {}
-    request_counts: Dict[str, int] = {}
+    prev_counters: Dict[str, int] = {}
 
     async def mock_batch_rate_limiter(*args, **kwargs):
         keys = kwargs.get("keys") if kwargs else args[0]
@@ -66,31 +66,51 @@ async def test_sliding_window_rate_limit_v3(monkeypatch, time_controller):
         now = args_list[0]
         window_size = args_list[1]
         results = []
-        for i in range(0, len(keys), 2):  # Fixed: should be 2, not 3
+        for i in range(0, len(keys), 2):  # Changed from 3 to 2
             window_key = keys[i]
             counter_key = keys[i + 1]
-            # Simulate window expiry
+            prev_counter_key = f"{counter_key}:prev"
+
+            # Get window start and current counter
             prev_window = window_starts.get(window_key)
-            prev_counter = request_counts.get(counter_key, 0)
+            prev_counter = await local_cache.async_get_cache(key=counter_key) or 0
+
             if prev_window is None or (now - prev_window) >= window_size:
-                # Window expired, reset
+                # Window needs reset - save current as previous
+                prev_counter_value = int(prev_counter) if prev_counter else 0
+                prev_counters[prev_counter_key] = prev_counter_value
+
+                # Start new window
                 window_starts[window_key] = now
                 new_counter = 1
-                request_counts[counter_key] = new_counter
+
                 await local_cache.async_set_cache(
-                    key=window_key, value=now, ttl=window_size
+                    key=window_key, value=now, ttl=window_size * 2
                 )
                 await local_cache.async_set_cache(
-                    key=counter_key, value=new_counter, ttl=window_size
+                    key=prev_counter_key, value=prev_counter_value, ttl=window_size * 2
                 )
+                await local_cache.async_set_cache(
+                    key=counter_key, value=new_counter, ttl=window_size * 2
+                )
+
+                # Calculate weighted count (elapsed=0, weight=1.0)
+                weighted_count = prev_counter_value * 1.0 + new_counter
             else:
-                new_counter = prev_counter + 1
-                request_counts[counter_key] = new_counter
+                # Within current window
+                new_counter = int(prev_counter) + 1
                 await local_cache.async_set_cache(
-                    key=counter_key, value=new_counter, ttl=window_size
+                    key=counter_key, value=new_counter, ttl=window_size * 2
                 )
+
+                # Calculate weighted count
+                elapsed = now - prev_window
+                weight = (window_size - elapsed) / window_size if elapsed < window_size else 0
+                prev_counter_value = prev_counters.get(prev_counter_key, 0)
+                weighted_count = prev_counter_value * weight + new_counter
+
             results.append(now)
-            results.append(new_counter)
+            results.append(int(weighted_count))
         return results
 
     parallel_request_handler.batch_rate_limiter_script = mock_batch_rate_limiter
@@ -105,12 +125,12 @@ async def test_sliding_window_rate_limit_v3(monkeypatch, time_controller):
         user_api_key_dict=user_api_key_dict, cache=local_cache, data={}, call_type=""
     )
 
-    # Third request should succeed (counter is 3, limit is 3, so 3 <= 3)
+    # Third request should succeed (at limit)
     await parallel_request_handler.async_pre_call_hook(
         user_api_key_dict=user_api_key_dict, cache=local_cache, data={}, call_type=""
     )
 
-    # Fourth request should fail (counter would be 4, limit is 3, so 4 > 3)
+    # Fourth request should fail (over limit)
     with pytest.raises(HTTPException) as exc_info:
         await parallel_request_handler.async_pre_call_hook(
             user_api_key_dict=user_api_key_dict,
@@ -128,7 +148,15 @@ async def test_sliding_window_rate_limit_v3(monkeypatch, time_controller):
 
     print(f"local_cache: {local_cache.in_memory_cache.cache_dict}")
 
-    # After window expires, should be able to make requests again
+    # With Sliding Window: Even after window expires, previous window affects the count
+    # Previous window had 4 requests, weight=1.0 at window boundary
+    # So first request after expiry: weighted_count = 4 * 1.0 + 1 = 5 > 3 (limit)
+    # This is expected behavior - need to wait for previous window to fully slide out
+
+    # After 2x window time (4 seconds total), previous window weight becomes 0
+    await asyncio.sleep(1)  # Total wait: 4 seconds > 2 * window_size
+
+    # Now should be able to make requests again (prev weight ~0)
     await parallel_request_handler.async_pre_call_hook(
         user_api_key_dict=user_api_key_dict, cache=local_cache, data={}, call_type=""
     )
@@ -149,9 +177,9 @@ async def test_rate_limiter_script_return_values_v3(monkeypatch, time_controller
         time_provider=time_controller.now,
     )
 
-    # Mock the batch_rate_limiter_script to simulate window expiry and use correct key construction
+    # Mock the batch_rate_limiter_script to simulate True Sliding Window
     window_starts: Dict[str, int] = {}
-    request_counts: Dict[str, int] = {}
+    prev_counters: Dict[str, int] = {}
 
     async def mock_batch_rate_limiter(*args, **kwargs):
         keys = kwargs.get("keys") if kwargs else args[0]
@@ -159,31 +187,51 @@ async def test_rate_limiter_script_return_values_v3(monkeypatch, time_controller
         now = args_list[0]
         window_size = args_list[1]
         results = []
-        for i in range(0, len(keys), 2):  # Fixed: should be 2, not 3
+        for i in range(0, len(keys), 2):  # Changed from 3 to 2
             window_key = keys[i]
             counter_key = keys[i + 1]
-            # Simulate window expiry
+            prev_counter_key = f"{counter_key}:prev"
+
+            # Get window start and current counter
             prev_window = window_starts.get(window_key)
-            prev_counter = request_counts.get(counter_key, 0)
+            prev_counter = await local_cache.async_get_cache(key=counter_key) or 0
+
             if prev_window is None or (now - prev_window) >= window_size:
-                # Window expired, reset
+                # Window needs reset - save current as previous
+                prev_counter_value = int(prev_counter) if prev_counter else 0
+                prev_counters[prev_counter_key] = prev_counter_value
+
+                # Start new window
                 window_starts[window_key] = now
                 new_counter = 1
-                request_counts[counter_key] = new_counter
+
                 await local_cache.async_set_cache(
-                    key=window_key, value=now, ttl=window_size
+                    key=window_key, value=now, ttl=window_size * 2
                 )
                 await local_cache.async_set_cache(
-                    key=counter_key, value=new_counter, ttl=window_size
+                    key=prev_counter_key, value=prev_counter_value, ttl=window_size * 2
                 )
+                await local_cache.async_set_cache(
+                    key=counter_key, value=new_counter, ttl=window_size * 2
+                )
+
+                # Calculate weighted count (elapsed=0, weight=1.0)
+                weighted_count = prev_counter_value * 1.0 + new_counter
             else:
-                new_counter = prev_counter + 1
-                request_counts[counter_key] = new_counter
+                # Within current window
+                new_counter = int(prev_counter) + 1
                 await local_cache.async_set_cache(
-                    key=counter_key, value=new_counter, ttl=window_size
+                    key=counter_key, value=new_counter, ttl=window_size * 2
                 )
+
+                # Calculate weighted count
+                elapsed = now - prev_window
+                weight = (window_size - elapsed) / window_size if elapsed < window_size else 0
+                prev_counter_value = prev_counters.get(prev_counter_key, 0)
+                weighted_count = prev_counter_value * weight + new_counter
+
             results.append(now)
-            results.append(new_counter)
+            results.append(int(weighted_count))
         return results
 
     parallel_request_handler.batch_rate_limiter_script = mock_batch_rate_limiter
@@ -300,9 +348,9 @@ async def test_normal_router_call_tpm_v3(monkeypatch, rate_limit_object, time_co
         time_provider=time_controller.now,
     )
 
-    # Mock the batch_rate_limiter_script to simulate window expiry and use correct key construction
+    # Mock the batch_rate_limiter_script to simulate True Sliding Window
     window_starts: Dict[str, int] = {}
-    request_counts: Dict[str, int] = {}
+    prev_counters: Dict[str, int] = {}
 
     async def mock_batch_rate_limiter(*args, **kwargs):
         print(f"args: {args}, kwargs: {kwargs}")
@@ -311,31 +359,51 @@ async def test_normal_router_call_tpm_v3(monkeypatch, rate_limit_object, time_co
         now = args_list[0]
         window_size = args_list[1]
         results = []
-        for i in range(0, len(keys), 2):  # Fixed: should be 2, not 3
+        for i in range(0, len(keys), 2):  # Changed from 3 to 2
             window_key = keys[i]
             counter_key = keys[i + 1]
-            # Simulate window expiry
+            prev_counter_key = f"{counter_key}:prev"
+
+            # Get window start and current counter
             prev_window = window_starts.get(window_key)
-            prev_counter = request_counts.get(counter_key, 0)
+            prev_counter = await local_cache.async_get_cache(key=counter_key) or 0
+
             if prev_window is None or (now - prev_window) >= window_size:
-                # Window expired, reset
+                # Window needs reset - save current as previous
+                prev_counter_value = int(prev_counter) if prev_counter else 0
+                prev_counters[prev_counter_key] = prev_counter_value
+
+                # Start new window
                 window_starts[window_key] = now
                 new_counter = 1
-                request_counts[counter_key] = new_counter
+
                 await local_cache.async_set_cache(
-                    key=window_key, value=now, ttl=window_size
+                    key=window_key, value=now, ttl=window_size * 2
                 )
                 await local_cache.async_set_cache(
-                    key=counter_key, value=new_counter, ttl=window_size
+                    key=prev_counter_key, value=prev_counter_value, ttl=window_size * 2
                 )
+                await local_cache.async_set_cache(
+                    key=counter_key, value=new_counter, ttl=window_size * 2
+                )
+
+                # Calculate weighted count (elapsed=0, weight=1.0)
+                weighted_count = prev_counter_value * 1.0 + new_counter
             else:
-                new_counter = prev_counter + 1
-                request_counts[counter_key] = new_counter
+                # Within current window
+                new_counter = int(prev_counter) + 1
                 await local_cache.async_set_cache(
-                    key=counter_key, value=new_counter, ttl=window_size
+                    key=counter_key, value=new_counter, ttl=window_size * 2
                 )
+
+                # Calculate weighted count
+                elapsed = now - prev_window
+                weight = (window_size - elapsed) / window_size if elapsed < window_size else 0
+                prev_counter_value = prev_counters.get(prev_counter_key, 0)
+                weighted_count = prev_counter_value * weight + new_counter
+
             results.append(now)
-            results.append(new_counter)
+            results.append(int(weighted_count))
         return results
 
     parallel_request_handler.batch_rate_limiter_script = mock_batch_rate_limiter
@@ -391,11 +459,7 @@ async def test_normal_router_call_tpm_v3(monkeypatch, rate_limit_object, time_co
         counter_value is not None
     ), f"Counter value should be stored in cache for {counter_key}"
 
-    # Manually increment the token counter to simulate token usage from previous call
-    # This simulates what would happen after a successful call
-    await local_cache.async_increment_cache(key=counter_key, value=15, ttl=2)  # Use up most of our 10 token limit
-    
-    # Make another request to test rate limiting - this should fail as we've consumed tokens
+    # Make another request to test rate limiting
     with pytest.raises(HTTPException) as exc_info:
         await parallel_request_handler.async_pre_call_hook(
             user_api_key_dict=user_api_key_dict,
@@ -1086,10 +1150,9 @@ async def test_async_increment_tokens_with_ttl_preservation():
     """
     import os
     import time
-
     from litellm.caching.redis_cache import RedisCache
     from litellm.types.caching import RedisPipelineIncrementOperation
-
+    
     # Skip test if Redis environment variables are not set
     redis_host = os.getenv("REDIS_HOST")
     redis_port = os.getenv("REDIS_PORT") 
@@ -1273,6 +1336,7 @@ async def test_async_increment_tokens_fallback_behavior():
     
     # Verify fallback was called
     assert fallback_called, "Fallback method should be called when Lua script is not available"
+<<<<<<< HEAD
 
 
 # Redis Cluster Compatibility Tests
